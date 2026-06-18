@@ -372,7 +372,11 @@
       document.getElementById("setupGuide").classList.add("hidden");
     }
     const savedChannels = localStorage.getItem("slackChannels");
-    if (savedChannels) channels = JSON.parse(savedChannels);
+    if (savedChannels) {
+      const parsed = JSON.parse(savedChannels);
+      // Only use saved channels if there are actually some saved
+      if (parsed && parsed.length > 0) channels = parsed;
+    }
     renderChannels();
   };
 
