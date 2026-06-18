@@ -371,12 +371,9 @@
       validateToken(saved);
       document.getElementById("setupGuide").classList.add("hidden");
     }
-    const savedChannels = localStorage.getItem("slackChannels");
-    if (savedChannels) {
-      const parsed = JSON.parse(savedChannels);
-      // Only use saved channels if there are actually some saved
-      if (parsed && parsed.length > 0) channels = parsed;
-    }
+    // Always use default channels — don't restore from localStorage
+    // (localStorage is only used to persist token)
+    localStorage.removeItem("slackChannels");
     renderChannels();
   };
 
