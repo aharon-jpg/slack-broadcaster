@@ -333,13 +333,19 @@
       form.append("limit", "1000");
       form.append("types", "public_channel,private_channel");
       if (cursor) form.append("cursor", cursor);
-      var res = await fetch("https://slack.com/api/conversations.list", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: form.toString()
-      });
+      var res;
+      try {
+        res = await fetch("https://slack.com/api/conversations.list", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: form.toString()
+        });
+      } catch(e) {
+        console.error("conversations.list network error:", e);
+        throw new Error("[step: list channels] network/CORS failure — check console for details");
+      }
       var data = await res.json();
-      if (!data.ok) throw new Error(data.error || "Failed to list channels");
+      if (!data.ok) throw new Error("[step: list channels] " + (data.error || "unknown error"));
       (data.channels || []).forEach(function(c) { idMap[c.name] = c.id; });
       cursor = (data.response_metadata && data.response_metadata.next_cursor) || "";
     } while (cursor);
@@ -352,19 +358,31 @@
     urlForm.append("token", token);
     urlForm.append("filename", file.name);
     urlForm.append("length", file.size);
-    var urlRes = await fetch("https://slack.com/api/files.getUploadURLExternal", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: urlForm.toString()
-    });
+    var urlRes;
+    try {
+      urlRes = await fetch("https://slack.com/api/files.getUploadURLExternal", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: urlForm.toString()
+      });
+    } catch(e) {
+      console.error("getUploadURLExternal network error:", e);
+      throw new Error("[step 1: get upload URL] network/CORS failure — check console for details");
+    }
     var urlData = await urlRes.json();
-    if (!urlData.ok) throw new Error(urlData.error || "Could not get upload URL");
+    if (!urlData.ok) throw new Error("[step 1: get upload URL] " + (urlData.error || "unknown error"));
 
     // Step 2: POST the raw file bytes to that URL
     var fd = new FormData();
     fd.append("file", file);
-    var uploadRes = await fetch(urlData.upload_url, { method: "POST", body: fd });
-    if (!uploadRes.ok) throw new Error("File upload to Slack failed (HTTP " + uploadRes.status + ")");
+    var uploadRes;
+    try {
+      uploadRes = await fetch(urlData.upload_url, { method: "POST", body: fd });
+    } catch(e) {
+      console.error("File byte upload network error:", e, "upload_url was:", urlData.upload_url);
+      throw new Error("[step 2: upload file bytes] network/CORS failure — check console for details");
+    }
+    if (!uploadRes.ok) throw new Error("[step 2: upload file bytes] Slack returned HTTP " + uploadRes.status);
 
     return urlData.file_id;
   }
@@ -375,16 +393,22 @@
       channel_id: channelId
     };
     if (comment) body.initial_comment = comment;
-    var res = await fetch("https://slack.com/api/files.completeUploadExternal", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Authorization": "Bearer " + token
-      },
-      body: JSON.stringify(body)
-    });
+    var res;
+    try {
+      res = await fetch("https://slack.com/api/files.completeUploadExternal", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json; charset=utf-8",
+          "Authorization": "Bearer " + token
+        },
+        body: JSON.stringify(body)
+      });
+    } catch(e) {
+      console.error("completeUploadExternal network error:", e);
+      throw new Error("[step: complete upload] network/CORS failure — check console for details");
+    }
     var data = await res.json();
-    if (!data.ok) throw new Error(data.error || "Could not share file to channel");
+    if (!data.ok) throw new Error("[step: complete upload] " + (data.error || "unknown error"));
   }
 
   // ── SEND ──────────────────────────────────────────────────
