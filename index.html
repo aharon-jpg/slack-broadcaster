@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
-  <title>Slack Broadcaster</title>
+  <title>The Megaphone</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f0f2f5; min-height: 100vh; display: flex; align-items: flex-start; justify-content: center; padding: 32px 16px; }
@@ -71,6 +71,7 @@
     #passErr { color: #e74c3c; font-size: 12px; min-height: 16px; margin-bottom: 8px; }
     #passBtn { width: 100%; padding: 11px; background: #4A154B; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 700; cursor: pointer; }
     #passBtn:hover { background: #3a0f3b; }
+    #passBtn:disabled { background: #ccc; cursor: not-allowed; }
   </style>
 </head>
 <body>
@@ -78,8 +79,8 @@
 <!-- Password Overlay -->
 <div id="passOverlay">
   <div id="passBox">
-    <div style="font-size:32px;margin-bottom:8px">💬</div>
-    <h2>Slack Broadcaster</h2>
+    <div style="font-size:32px;margin-bottom:8px">📣</div>
+    <h2>The Megaphone</h2>
     <p>Enter password to continue</p>
     <input type="password" id="passInput" placeholder="Password">
     <div id="passErr"></div>
@@ -89,9 +90,9 @@
 
 <div class="app">
   <div class="header">
-    <div class="header-icon">💬</div>
+    <div class="header-icon">📣</div>
     <div>
-      <h1>Slack Broadcaster</h1>
+      <h1>The Megaphone</h1>
       <p>Send a message to multiple channels at once</p>
     </div>
   </div>
@@ -138,26 +139,43 @@
 
 <script>
   // ── PASSWORD ──────────────────────────────────────────────
-  var PASS = "aharon1!";
-  var overlay = document.getElementById("passOverlay");
+  // Client-side password gating on a static page can never be true
+  // security (anyone can view source or open devtools), but hashing
+  // instead of storing the raw string in plaintext at least means the
+  // password isn't sitting there in cleartext for a casual "view source".
+  var PASS_HASH = "b8fb4dd374aa8f9b60a881f3b0bda33c02a55109d8e2e4fc176d9dd3c3c9dd94";
+  var overlay  = document.getElementById("passOverlay");
   var passInput = document.getElementById("passInput");
-  var passErr = document.getElementById("passErr");
-  var passBtn = document.getElementById("passBtn");
+  var passErr   = document.getElementById("passErr");
+  var passBtn   = document.getElementById("passBtn");
+  var failCount = 0;
 
-  if (sessionStorage.getItem("auth") === PASS) {
+  async function sha256(text) {
+    var enc = new TextEncoder().encode(text);
+    var buf = await crypto.subtle.digest("SHA-256", enc);
+    return Array.from(new Uint8Array(buf)).map(function(b){ return b.toString(16).padStart(2,"0"); }).join("");
+  }
+
+  if (sessionStorage.getItem("auth") === "1") {
     overlay.style.display = "none";
   } else {
     setTimeout(function() { passInput.focus(); }, 100);
   }
 
-  passBtn.addEventListener("click", function() {
-    if (passInput.value === PASS) {
-      sessionStorage.setItem("auth", PASS);
+  passBtn.addEventListener("click", async function() {
+    var hash = await sha256(passInput.value);
+    if (hash === PASS_HASH) {
+      sessionStorage.setItem("auth", "1");
       overlay.style.display = "none";
     } else {
+      failCount++;
       passErr.textContent = "Incorrect password — try again";
       passInput.value = "";
-      passInput.focus();
+      // Small increasing delay after repeated wrong attempts — not real
+      // rate limiting, just a mild deterrent against quick guessing.
+      var delay = Math.min(failCount * 500, 3000);
+      passBtn.disabled = true;
+      setTimeout(function() { passBtn.disabled = false; passInput.focus(); }, delay);
     }
   });
 
@@ -299,6 +317,76 @@
     document.getElementById("charCount").textContent = document.getElementById("messageInput").value.length;
   }
 
+  // ── FILE UPLOAD (Slack's newer 3-step external upload flow) ───
+  // The old single-call files.upload endpoint is deprecated. The
+  // current flow is: (1) ask Slack for an upload URL + file_id,
+  // (2) POST the raw file bytes to that URL, (3) tell Slack to finalize
+  // the upload and share it into a channel. Step 3 takes one channel ID
+  // at a time, so for multiple channels we resolve all channel names to
+  // IDs once, then complete the upload once per channel.
+  async function resolveChannelIds(token, names) {
+    var idMap = {};
+    var cursor = "";
+    do {
+      var form = new URLSearchParams();
+      form.append("token", token);
+      form.append("limit", "1000");
+      form.append("types", "public_channel,private_channel");
+      if (cursor) form.append("cursor", cursor);
+      var res = await fetch("https://slack.com/api/conversations.list", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form.toString()
+      });
+      var data = await res.json();
+      if (!data.ok) throw new Error(data.error || "Failed to list channels");
+      (data.channels || []).forEach(function(c) { idMap[c.name] = c.id; });
+      cursor = (data.response_metadata && data.response_metadata.next_cursor) || "";
+    } while (cursor);
+    return idMap;
+  }
+
+  async function uploadFileToSlack(token, file) {
+    // Step 1: get an upload URL + file_id
+    var urlForm = new URLSearchParams();
+    urlForm.append("token", token);
+    urlForm.append("filename", file.name);
+    urlForm.append("length", file.size);
+    var urlRes = await fetch("https://slack.com/api/files.getUploadURLExternal", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: urlForm.toString()
+    });
+    var urlData = await urlRes.json();
+    if (!urlData.ok) throw new Error(urlData.error || "Could not get upload URL");
+
+    // Step 2: POST the raw file bytes to that URL
+    var fd = new FormData();
+    fd.append("file", file);
+    var uploadRes = await fetch(urlData.upload_url, { method: "POST", body: fd });
+    if (!uploadRes.ok) throw new Error("File upload to Slack failed (HTTP " + uploadRes.status + ")");
+
+    return urlData.file_id;
+  }
+
+  async function completeUploadToChannel(token, fileId, filename, channelId, comment) {
+    var body = {
+      files: [{ id: fileId, title: filename }],
+      channel_id: channelId
+    };
+    if (comment) body.initial_comment = comment;
+    var res = await fetch("https://slack.com/api/files.completeUploadExternal", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": "Bearer " + token
+      },
+      body: JSON.stringify(body)
+    });
+    var data = await res.json();
+    if (!data.ok) throw new Error(data.error || "Could not share file to channel");
+  }
+
   // ── SEND ──────────────────────────────────────────────────
   async function send() {
     var token   = document.getElementById("tokenInput").value.trim();
@@ -306,7 +394,7 @@
     var selected = channels.filter(function(c) { return c.selected; });
 
     if (!token)           { alert("Please enter your Slack bot token."); return; }
-    if (!message)         { alert("Please write a message."); return; }
+    if (!message && !attachedFile) { alert("Please write a message or attach a file."); return; }
     if (!selected.length) { alert("Please select at least one channel."); return; }
 
     var btn = document.getElementById("sendBtn");
@@ -316,17 +404,43 @@
     var results = document.getElementById("results");
     results.innerHTML = "";
 
+    // If a file is attached, upload the bytes once and resolve channel
+    // names to IDs once, up front — much cheaper than re-uploading per
+    // channel, and completeUploadExternal needs real channel IDs.
+    var fileId = null;
+    var idMap = null;
+    var prepError = null;
+    if (attachedFile) {
+      try {
+        btn.textContent = "Uploading file...";
+        fileId = await uploadFileToSlack(token, attachedFile);
+        idMap = await resolveChannelIds(token, selected.map(function(c){ return c.name; }));
+      } catch(e) {
+        prepError = e.message;
+      }
+    }
+
     for (var i = 0; i < selected.length; i++) {
       var ch = selected[i];
       try {
-        var form = new URLSearchParams();
-        form.append("token", token);
-        form.append("channel", ch.name);
-        form.append("text", message);
-        var res  = await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() });
-        var data = await res.json();
-        if (!data.ok) throw new Error(data.error || "Unknown error");
-        addResult(results, ch.name, true, attachedFile ? "Message sent (file upload coming)" : "Message sent");
+        if (message) {
+          var form = new URLSearchParams();
+          form.append("token", token);
+          form.append("channel", ch.name);
+          form.append("text", message);
+          var res  = await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() });
+          var data = await res.json();
+          if (!data.ok) throw new Error(data.error || "Unknown error");
+        }
+
+        if (attachedFile) {
+          if (prepError) throw new Error(prepError);
+          var channelId = idMap[ch.name];
+          if (!channelId) throw new Error("Couldn't resolve #" + ch.name + " to a channel ID — is the bot a member of it?");
+          await completeUploadToChannel(token, fileId, attachedFile.name, channelId, message ? "" : undefined);
+        }
+
+        addResult(results, ch.name, true, attachedFile ? (message ? "Message + file sent" : "File sent") : "Message sent");
       } catch(e) {
         addResult(results, ch.name, false, e.message);
       }
