@@ -317,98 +317,35 @@
     document.getElementById("charCount").textContent = document.getElementById("messageInput").value.length;
   }
 
-  // ── FILE UPLOAD (Slack's newer 3-step external upload flow) ───
-  // The old single-call files.upload endpoint is deprecated. The
-  // current flow is: (1) ask Slack for an upload URL + file_id,
-  // (2) POST the raw file bytes to that URL, (3) tell Slack to finalize
-  // the upload and share it into a channel. Step 3 takes one channel ID
-  // at a time, so for multiple channels we resolve all channel names to
-  // IDs once, then complete the upload once per channel.
-  async function resolveChannelIds(token, names) {
-    var idMap = {};
-    var cursor = "";
-    do {
-      var form = new URLSearchParams();
-      form.append("token", token);
-      form.append("limit", "1000");
-      form.append("types", "public_channel,private_channel");
-      if (cursor) form.append("cursor", cursor);
-      var res;
-      try {
-        res = await fetch("https://slack.com/api/conversations.list", {
-          method: "POST",
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: form.toString()
-        });
-      } catch(e) {
-        console.error("conversations.list network error:", e);
-        throw new Error("[step: list channels] network/CORS failure — check console for details");
-      }
-      var data = await res.json();
-      if (!data.ok) throw new Error("[step: list channels] " + (data.error || "unknown error"));
-      (data.channels || []).forEach(function(c) { idMap[c.name] = c.id; });
-      cursor = (data.response_metadata && data.response_metadata.next_cursor) || "";
-    } while (cursor);
-    return idMap;
-  }
-
-  async function uploadFileToSlack(token, file) {
-    // Step 1: get an upload URL + file_id
-    var urlForm = new URLSearchParams();
-    urlForm.append("token", token);
-    urlForm.append("filename", file.name);
-    urlForm.append("length", file.size);
-    var urlRes;
-    try {
-      urlRes = await fetch("https://slack.com/api/files.getUploadURLExternal", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: urlForm.toString()
-      });
-    } catch(e) {
-      console.error("getUploadURLExternal network error:", e);
-      throw new Error("[step 1: get upload URL] network/CORS failure — check console for details");
-    }
-    var urlData = await urlRes.json();
-    if (!urlData.ok) throw new Error("[step 1: get upload URL] " + (urlData.error || "unknown error"));
-
-    // Step 2: POST the raw file bytes to that URL
+  // ── FILE UPLOAD ─────────────────────────────────────────────
+  // Slack's newer 3-step external upload flow requires POSTing file
+  // bytes directly to files.slack.com, which does NOT support CORS for
+  // browser-based requests from arbitrary origins (confirmed by testing:
+  // "No 'Access-Control-Allow-Origin' header is present" from the
+  // browser itself, not something fixable in this code). The older
+  // files.upload endpoint lives on slack.com/api — the same domain
+  // chat.postMessage/auth.test already use successfully — and does
+  // support CORS. It's officially deprecated by Slack and could stop
+  // working without notice at some point, but it's the only option that
+  // works from a pure static page with no backend. If Slack ever retires
+  // it for real, the fix would be routing through a small server-side
+  // proxy (e.g. a Cloudflare Worker) instead.
+  async function uploadFileLegacy(token, channelName, file, comment) {
     var fd = new FormData();
+    fd.append("token", token);
+    fd.append("channels", channelName);
     fd.append("file", file);
-    var uploadRes;
-    try {
-      uploadRes = await fetch(urlData.upload_url, { method: "POST", body: fd });
-    } catch(e) {
-      console.error("File byte upload network error:", e, "upload_url was:", urlData.upload_url);
-      throw new Error("[step 2: upload file bytes] network/CORS failure — check console for details");
-    }
-    if (!uploadRes.ok) throw new Error("[step 2: upload file bytes] Slack returned HTTP " + uploadRes.status);
-
-    return urlData.file_id;
-  }
-
-  async function completeUploadToChannel(token, fileId, filename, channelId, comment) {
-    var body = {
-      files: [{ id: fileId, title: filename }],
-      channel_id: channelId
-    };
-    if (comment) body.initial_comment = comment;
+    fd.append("filename", file.name);
+    if (comment) fd.append("initial_comment", comment);
     var res;
     try {
-      res = await fetch("https://slack.com/api/files.completeUploadExternal", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json; charset=utf-8",
-          "Authorization": "Bearer " + token
-        },
-        body: JSON.stringify(body)
-      });
+      res = await fetch("https://slack.com/api/files.upload", { method: "POST", body: fd });
     } catch(e) {
-      console.error("completeUploadExternal network error:", e);
-      throw new Error("[step: complete upload] network/CORS failure — check console for details");
+      console.error("files.upload network error:", e);
+      throw new Error("[file upload] network/CORS failure — check console for details");
     }
     var data = await res.json();
-    if (!data.ok) throw new Error("[step: complete upload] " + (data.error || "unknown error"));
+    if (!data.ok) throw new Error("[file upload] " + (data.error || "unknown error"));
   }
 
   // ── SEND ──────────────────────────────────────────────────
@@ -428,26 +365,15 @@
     var results = document.getElementById("results");
     results.innerHTML = "";
 
-    // If a file is attached, upload the bytes once and resolve channel
-    // names to IDs once, up front — much cheaper than re-uploading per
-    // channel, and completeUploadExternal needs real channel IDs.
-    var fileId = null;
-    var idMap = null;
-    var prepError = null;
-    if (attachedFile) {
-      try {
-        btn.textContent = "Uploading file...";
-        fileId = await uploadFileToSlack(token, attachedFile);
-        idMap = await resolveChannelIds(token, selected.map(function(c){ return c.name; }));
-      } catch(e) {
-        prepError = e.message;
-      }
-    }
-
     for (var i = 0; i < selected.length; i++) {
       var ch = selected[i];
       try {
-        if (message) {
+        if (attachedFile) {
+          // When a file is attached, send it with the message as its
+          // caption in one post, rather than two separate messages.
+          btn.textContent = "Uploading to #" + ch.name + "...";
+          await uploadFileLegacy(token, ch.name, attachedFile, message);
+        } else {
           var form = new URLSearchParams();
           form.append("token", token);
           form.append("channel", ch.name);
@@ -455,13 +381,6 @@
           var res  = await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() });
           var data = await res.json();
           if (!data.ok) throw new Error(data.error || "Unknown error");
-        }
-
-        if (attachedFile) {
-          if (prepError) throw new Error(prepError);
-          var channelId = idMap[ch.name];
-          if (!channelId) throw new Error("Couldn't resolve #" + ch.name + " to a channel ID — is the bot a member of it?");
-          await completeUploadToChannel(token, fileId, attachedFile.name, channelId, message ? "" : undefined);
         }
 
         addResult(results, ch.name, true, attachedFile ? (message ? "Message + file sent" : "File sent") : "Message sent");
