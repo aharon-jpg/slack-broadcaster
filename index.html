@@ -318,34 +318,44 @@
   }
 
   // ── FILE UPLOAD ─────────────────────────────────────────────
-  // Slack's newer 3-step external upload flow requires POSTing file
-  // bytes directly to files.slack.com, which does NOT support CORS for
-  // browser-based requests from arbitrary origins (confirmed by testing:
-  // "No 'Access-Control-Allow-Origin' header is present" from the
-  // browser itself, not something fixable in this code). The older
-  // files.upload endpoint lives on slack.com/api — the same domain
-  // chat.postMessage/auth.test already use successfully — and does
-  // support CORS. It's officially deprecated by Slack and could stop
-  // working without notice at some point, but it's the only option that
-  // works from a pure static page with no backend. If Slack ever retires
-  // it for real, the fix would be routing through a small server-side
-  // proxy (e.g. a Cloudflare Worker) instead.
-  async function uploadFileLegacy(token, channelName, file, comment) {
+  // Both direct-from-browser approaches are genuine dead ends, confirmed
+  // by testing against the live Slack API:
+  //   - The newer 3-step external upload flow requires POSTing file bytes
+  //     directly to files.slack.com, which returns a hard CORS block for
+  //     browser requests from arbitrary origins.
+  //   - The older files.upload endpoint (same slack.com/api domain as
+  //     chat.postMessage, which IS CORS-friendly) now returns
+  //     "method_deprecated" — Slack has actively disabled it for this app.
+  // Neither can be fixed with more client-side code; a static page simply
+  // cannot upload files to Slack directly anymore. The fix is a small
+  // server-side proxy (a Cloudflare Worker — see worker.js) that does the
+  // upload from the server side, where CORS doesn't apply at all. This
+  // function just hands the file + channel list + comment to that proxy
+  // in one call and relays back its per-channel results.
+  //
+  // IMPORTANT: replace this with your actual deployed Worker URL after
+  // following the setup steps at the top of worker.js.
+  var WORKER_URL = "https://delicate-unit-eb38.aharon-20b.workers.dev";
+
+  async function uploadFileViaProxy(token, channelNames, file, comment) {
+    if (WORKER_URL.indexOf("REPLACE-WITH-YOUR-WORKER-URL") !== -1) {
+      throw new Error("[file upload] WORKER_URL isn't set yet — deploy the Cloudflare Worker and paste its URL into index.html");
+    }
     var fd = new FormData();
     fd.append("token", token);
-    fd.append("channels", channelName);
+    fd.append("channels", channelNames.join(","));
     fd.append("file", file);
-    fd.append("filename", file.name);
-    if (comment) fd.append("initial_comment", comment);
+    if (comment) fd.append("comment", comment);
     var res;
     try {
-      res = await fetch("https://slack.com/api/files.upload", { method: "POST", body: fd });
+      res = await fetch(WORKER_URL, { method: "POST", body: fd });
     } catch(e) {
-      console.error("files.upload network error:", e);
-      throw new Error("[file upload] network/CORS failure — check console for details");
+      console.error("Upload proxy network error:", e);
+      throw new Error("[file upload] couldn't reach the upload proxy — is it deployed? (" + e.message + ")");
     }
     var data = await res.json();
-    if (!data.ok) throw new Error("[file upload] " + (data.error || "unknown error"));
+    if (!data.ok) throw new Error("[file upload] " + (data.error || "unknown proxy error"));
+    return data.results; // [{ channel, ok, error? }, ...]
   }
 
   // ── SEND ──────────────────────────────────────────────────
@@ -360,20 +370,26 @@
 
     var btn = document.getElementById("sendBtn");
     btn.disabled = true;
-    btn.textContent = "Sending to " + selected.length + " channel(s)...";
+    btn.textContent = attachedFile ? "Uploading via proxy..." : "Sending to " + selected.length + " channel(s)...";
 
     var results = document.getElementById("results");
     results.innerHTML = "";
 
-    for (var i = 0; i < selected.length; i++) {
-      var ch = selected[i];
+    if (attachedFile) {
+      // One proxy call handles every selected channel at once — the file
+      // bytes only need to be uploaded to Slack a single time.
       try {
-        if (attachedFile) {
-          // When a file is attached, send it with the message as its
-          // caption in one post, rather than two separate messages.
-          btn.textContent = "Uploading to #" + ch.name + "...";
-          await uploadFileLegacy(token, ch.name, attachedFile, message);
-        } else {
+        var proxyResults = await uploadFileViaProxy(token, selected.map(function(c){ return c.name; }), attachedFile, message);
+        proxyResults.forEach(function(r) {
+          addResult(results, r.channel, r.ok, r.ok ? (message ? "Message + file sent" : "File sent") : r.error);
+        });
+      } catch(e) {
+        selected.forEach(function(c) { addResult(results, c.name, false, e.message); });
+      }
+    } else {
+      for (var i = 0; i < selected.length; i++) {
+        var ch = selected[i];
+        try {
           var form = new URLSearchParams();
           form.append("token", token);
           form.append("channel", ch.name);
@@ -381,11 +397,10 @@
           var res  = await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() });
           var data = await res.json();
           if (!data.ok) throw new Error(data.error || "Unknown error");
+          addResult(results, ch.name, true, "Message sent");
+        } catch(e) {
+          addResult(results, ch.name, false, e.message);
         }
-
-        addResult(results, ch.name, true, attachedFile ? (message ? "Message + file sent" : "File sent") : "Message sent");
-      } catch(e) {
-        addResult(results, ch.name, false, e.message);
       }
     }
 
