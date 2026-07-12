@@ -60,6 +60,7 @@
     .result-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
     .result-row.success .result-dot { background: #27ae60; }
     .result-row.error .result-dot { background: #e74c3c; }
+    .result-meta { color: #999; font-size: 11px; margin-left: auto; font-family: monospace; }
 
     /* Password overlay */
     #passOverlay { position: fixed; inset: 0; background: #1a1a2e; display: flex; align-items: center; justify-content: center; z-index: 9999; }
@@ -396,11 +397,26 @@
           form.append("text", message);
           var res  = await fetch("https://slack.com/api/chat.postMessage", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: form.toString() });
           var data = await res.json();
+          // IMPORTANT DIAGNOSTIC: Slack's response always includes the
+          // actual resolved channel ID it posted to in data.channel, and
+          // sometimes a data.warning field (e.g. "already_in_channel",
+          // "missing_charset"). We surface both here — if every request
+          // reports success but data.channel is IDENTICAL across requests
+          // that used different channel names, that's proof Slack is
+          // silently resolving them all to the same underlying channel
+          // (the actual bug), rather than the requests failing outright.
           if (!data.ok) throw new Error(data.error || "Unknown error");
-          addResult(results, ch.name, true, "Message sent");
+          var meta = (data.channel ? data.channel : "") + (data.warning ? " ⚠ " + data.warning : "");
+          addResult(results, ch.name, true, "Message sent", meta);
         } catch(e) {
           addResult(results, ch.name, false, e.message);
         }
+        // Slack's chat.postMessage is rate-limited per-workspace (roughly
+        // ~1 request/sec sustained on a standard app tier). Firing every
+        // request back-to-back with no gap risks a 429 that would show up
+        // here as an error on later channels in the list. A small delay
+        // between sends costs a few seconds total but avoids that.
+        await new Promise(function(resolve){ setTimeout(resolve, 350); });
       }
     }
 
@@ -408,10 +424,11 @@
     btn.textContent = "Send to Selected Channels";
   }
 
-  function addResult(container, channel, success, message) {
+  function addResult(container, channel, success, message, meta) {
     var div = document.createElement("div");
     div.className = "result-row " + (success ? "success" : "error");
-    div.innerHTML = '<div class="result-dot"></div><b>#' + channel + '</b> — ' + message;
+    div.innerHTML = '<div class="result-dot"></div><b>#' + channel + '</b> — ' + message
+      + (meta ? '<span class="result-meta">' + meta + '</span>' : '');
     container.appendChild(div);
   }
 </script>
